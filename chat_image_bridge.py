@@ -1,0 +1,584 @@
+import base64
+import json
+import re
+import time
+from io import BytesIO
+from urllib.parse import quote
+
+import numpy as np
+import requests
+import torch
+from PIL import Image, ImageOps
+
+
+DATA_IMAGE_RE = re.compile(
+    r"data:image/(?P<mime>[A-Za-z0-9.+-]+);base64,(?P<b64>(?:[A-Za-z0-9+/=]|\r|\n)+)",
+    re.I,
+)
+URL_RE = re.compile(r"https?://[^\s)\]\"'<>]+", re.I)
+RESOLUTION_OPTIONS = ["auto", "1K", "2K", "4K"]
+ASPECT_RATIO_OPTIONS = ["auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"]
+DEFAULT_MODEL = "gemini-3-pro-image-preview"
+
+
+def normalize_endpoint(base_url):
+    value = (base_url or "").strip().rstrip("/")
+    if not value:
+        raise ValueError("base_url is required")
+    if value.endswith("/chat/completions"):
+        return value
+    if value.endswith("/v1"):
+        return f"{value}/chat/completions"
+    return f"{value}/v1/chat/completions"
+
+
+def normalize_models_endpoint(base_url):
+    value = (base_url or "").strip().rstrip("/")
+    if not value:
+        raise ValueError("base_url is required")
+    if value.endswith("/chat/completions"):
+        return value[: -len("/chat/completions")] + "/models"
+    if value.endswith("/v1"):
+        return f"{value}/models"
+    return f"{value}/v1/models"
+
+
+def normalize_gemini_base(base_url):
+    value = (base_url or "").strip().rstrip("/")
+    if not value:
+        raise ValueError("base_url is required")
+    if value.endswith("/chat/completions"):
+        value = value[: -len("/chat/completions")]
+    if value.endswith("/v1"):
+        value = value[: -len("/v1")]
+    return value.rstrip("/")
+
+
+def normalize_gemini_endpoint(base_url, model):
+    root = normalize_gemini_base(base_url)
+    return f"{root}/v1beta/models/{quote(model, safe='')}:generateContent"
+
+
+def extract_model_ids(payload):
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("data") or payload.get("models") or payload.get("model") or []
+    else:
+        items = []
+
+    models = []
+    if isinstance(items, str):
+        models.append(items)
+    elif isinstance(items, list):
+        for item in items:
+            if isinstance(item, str):
+                models.append(item)
+            elif isinstance(item, dict):
+                model_id = item.get("id") or item.get("name") or item.get("model")
+                if model_id:
+                    models.append(str(model_id))
+
+    unique = []
+    seen = set()
+    for model in models:
+        if model not in seen:
+            seen.add(model)
+            unique.append(model)
+    return unique
+
+
+def compose_prompt(prompt, resolution="auto", aspect_ratio="auto"):
+    hints = []
+    resolution = (resolution or "auto").strip()
+    aspect_ratio = (aspect_ratio or "auto").strip()
+
+    if resolution and resolution.lower() != "auto":
+        hints.append(f"Resolution: {resolution}.")
+    if aspect_ratio and aspect_ratio.lower() != "auto":
+        hints.append(f"Aspect ratio: {aspect_ratio}.")
+
+    if not hints:
+        return prompt
+    return "\n".join(hints + [prompt])
+
+
+def normalize_generation_option(value):
+    value = (value or "").strip()
+    if not value or value.lower() == "auto":
+        return ""
+    return value
+
+
+def tensor_to_png_data_url(tensor):
+    image = tensor.detach().cpu() if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor)
+    if image.ndim == 4:
+        image = image[0]
+    if image.ndim != 3:
+        raise ValueError(f"Expected IMAGE tensor with 3 or 4 dimensions, got shape {tuple(image.shape)}")
+
+    # ComfyUI images are usually HWC, but accept CHW tensors defensively.
+    if image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+        image = image.permute(1, 2, 0)
+
+    arr = image.clamp(0, 1).numpy()
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    arr = (arr * 255.0).round().astype(np.uint8)
+
+    pil = Image.fromarray(arr)
+    if pil.mode not in ("RGB", "RGBA"):
+        pil = pil.convert("RGB")
+
+    buffer = BytesIO()
+    pil.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def tensor_to_png_inline_data(tensor):
+    data_url = tensor_to_png_data_url(tensor)
+    return {"mimeType": "image/png", "data": data_url.split(",", 1)[1]}
+
+
+def image_bytes_to_tensor(image_bytes):
+    img = Image.open(BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    arr = np.array(img).astype(np.float32) / 255.0
+    return torch.from_numpy(arr).unsqueeze(0).float()
+
+
+def data_url_to_bytes(value):
+    match = DATA_IMAGE_RE.search(value or "")
+    if not match:
+        raise ValueError("Invalid data:image base64 value")
+    b64 = re.sub(r"\s+", "", match.group("b64"))
+    return base64.b64decode(b64)
+
+
+def extract_image_references(text):
+    if not text:
+        return []
+
+    refs = []
+    refs.extend(match.group(0) for match in DATA_IMAGE_RE.finditer(text))
+    refs.extend(match.group(0).rstrip(".,") for match in URL_RE.finditer(text))
+
+    unique = []
+    seen = set()
+    for ref in refs:
+        if ref not in seen:
+            seen.add(ref)
+            unique.append(ref)
+    return unique
+
+
+def collect_image_references(value):
+    refs = []
+    if isinstance(value, str):
+        refs.extend(extract_image_references(value))
+    elif isinstance(value, list):
+        for item in value:
+            refs.extend(collect_image_references(item))
+    elif isinstance(value, dict):
+        inline_data = value.get("inlineData") or value.get("inline_data")
+        if isinstance(inline_data, dict) and isinstance(inline_data.get("data"), str):
+            mime = inline_data.get("mimeType") or inline_data.get("mime_type") or "image/png"
+            refs.append(f"data:{mime};base64,{inline_data['data']}")
+
+        for key, item in value.items():
+            if key == "b64_json" and isinstance(item, str):
+                refs.append("data:image/png;base64," + item)
+            else:
+                refs.extend(collect_image_references(item))
+
+    unique = []
+    seen = set()
+    for ref in refs:
+        if ref not in seen:
+            seen.add(ref)
+            unique.append(ref)
+    return unique
+
+
+def redact_data_urls(text):
+    def repl(match):
+        mime = match.group("mime")
+        b64_len = len(re.sub(r"\s+", "", match.group("b64")))
+        return f"data:image/{mime};base64,<redacted {b64_len} chars>"
+
+    return DATA_IMAGE_RE.sub(repl, text)
+
+
+def redact_object(value):
+    if isinstance(value, str):
+        return redact_data_urls(value)
+    if isinstance(value, list):
+        return [redact_object(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_object(item) for key, item in value.items()}
+    return value
+
+
+def summarize_ref(ref):
+    match = DATA_IMAGE_RE.search(ref or "")
+    if match:
+        b64_len = len(re.sub(r"\s+", "", match.group("b64")))
+        return f"data:image/{match.group('mime')};base64,<redacted {b64_len} chars>"
+    return ref
+
+
+class ChatImageBridgeBase:
+    def _image_config(self, resolution="", aspect_ratio=""):
+        image_config = {}
+        resolution = normalize_generation_option(resolution)
+        aspect_ratio = normalize_generation_option(aspect_ratio)
+
+        if resolution:
+            image_config["imageSize"] = resolution
+        if aspect_ratio:
+            image_config["aspectRatio"] = aspect_ratio
+        return image_config
+
+    def _build_payload(
+        self,
+        model,
+        prompt,
+        system_prompt,
+        size,
+        extra_body_json,
+        image_inputs,
+        resolution="",
+        aspect_ratio="",
+    ):
+        image_data_urls = [tensor_to_png_data_url(image) for image in image_inputs if image is not None]
+        if image_data_urls:
+            content = [{"type": "text", "text": prompt}]
+            content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_data_urls)
+        else:
+            content = prompt
+
+        messages = []
+        if (system_prompt or "").strip():
+            messages.append({"role": "system", "content": system_prompt.strip()})
+        messages.append({"role": "user", "content": content})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
+
+        if (size or "").strip():
+            payload["size"] = size.strip()
+
+        image_config = self._image_config(resolution, aspect_ratio)
+        if image_config:
+            payload["generationConfig"] = {
+                "responseModalities": ["TEXT", "IMAGE"],
+                "imageConfig": image_config,
+            }
+
+        if (extra_body_json or "").strip():
+            extra = json.loads(extra_body_json)
+            if not isinstance(extra, dict):
+                raise ValueError("extra_body_json must be a JSON object")
+            payload.update(extra)
+
+        return payload
+
+    def _build_gemini_payload(self, prompt, system_prompt, extra_body_json, image_inputs, resolution="", aspect_ratio=""):
+        parts = []
+        for image in image_inputs:
+            if image is not None:
+                parts.append({"inlineData": tensor_to_png_inline_data(image)})
+        parts.append({"text": prompt})
+
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": parts,
+                }
+            ],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+            },
+        }
+
+        image_config = self._image_config(resolution, aspect_ratio)
+        if image_config:
+            payload["generationConfig"]["imageConfig"] = image_config
+
+        if (system_prompt or "").strip():
+            payload["systemInstruction"] = {"parts": [{"text": system_prompt.strip()}]}
+
+        if (extra_body_json or "").strip():
+            extra = json.loads(extra_body_json)
+            if not isinstance(extra, dict):
+                raise ValueError("extra_body_json must be a JSON object")
+            payload.update(extra)
+
+        return payload
+
+    def _should_use_native_gemini(self, model, resolution="", aspect_ratio=""):
+        model_name = (model or "").lower()
+        has_image_config = bool(self._image_config(resolution, aspect_ratio))
+        return has_image_config and "gemini" in model_name
+
+    def _post_with_retries(self, endpoint, api_key, payload, timeout_seconds, retry_times):
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+            "User-Agent": "ComfyUI-ChatImageBridge/1.0",
+        }
+
+        last_error = None
+        for attempt in range(1, retry_times + 1):
+            try:
+                response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds)
+                if response.status_code >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+                return response.json()
+            except Exception as exc:
+                last_error = exc
+                if attempt < retry_times:
+                    time.sleep(min(2 * attempt, 8))
+        raise RuntimeError(f"Chat image request failed after {retry_times} attempt(s): {last_error}")
+
+    def _decode_refs_to_image(self, refs, timeout_seconds):
+        tensors = []
+        decoded_refs = []
+
+        for ref in refs:
+            try:
+                if ref.lower().startswith("data:image/"):
+                    image_bytes = data_url_to_bytes(ref)
+                else:
+                    response = requests.get(ref, timeout=timeout_seconds)
+                    response.raise_for_status()
+                    image_bytes = response.content
+
+                tensor = image_bytes_to_tensor(image_bytes)
+                tensors.append(tensor)
+                decoded_refs.append(ref)
+            except Exception as exc:
+                print(f"[Chat Image Bridge] Skipped image reference: {summarize_ref(ref)} ({exc})")
+
+        if not tensors:
+            raise RuntimeError("No decodable image was found in the chat completion response")
+
+        base_shape = tensors[0].shape[1:]
+        same_shape = [tensor for tensor in tensors if tensor.shape[1:] == base_shape]
+        if len(same_shape) != len(tensors):
+            print("[Chat Image Bridge] Returned images have different sizes; outputting images matching the first size.")
+
+        return torch.cat(same_shape, dim=0), decoded_refs
+
+    def _generate(
+        self,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        system_prompt,
+        size,
+        extra_body_json,
+        timeout_seconds,
+        retry_times,
+        redact_response,
+        resolution="",
+        aspect_ratio="",
+        **kwargs,
+    ):
+        if not (api_key or "").strip():
+            raise ValueError("api_key is required")
+        if not (model or "").strip():
+            raise ValueError("model is required")
+        if not (prompt or "").strip():
+            raise ValueError("prompt is required")
+
+        image_inputs = [kwargs.get(f"image_{i:02d}") for i in range(1, 15)]
+
+        if self._should_use_native_gemini(model, resolution, aspect_ratio):
+            try:
+                endpoint = normalize_gemini_endpoint(base_url, model.strip())
+                payload = self._build_gemini_payload(
+                    prompt,
+                    system_prompt,
+                    extra_body_json,
+                    image_inputs,
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                )
+                data = self._post_with_retries(endpoint, api_key, payload, int(timeout_seconds), int(retry_times))
+            except Exception as exc:
+                print(f"[Chat Image Bridge] Native Gemini request failed; falling back to chat/completions: {exc}")
+                endpoint = normalize_endpoint(base_url)
+                payload = self._build_payload(
+                    model.strip(),
+                    compose_prompt(prompt, resolution, aspect_ratio),
+                    system_prompt,
+                    size,
+                    extra_body_json,
+                    image_inputs,
+                    resolution=resolution,
+                    aspect_ratio=aspect_ratio,
+                )
+                data = self._post_with_retries(endpoint, api_key, payload, int(timeout_seconds), int(retry_times))
+        else:
+            endpoint = normalize_endpoint(base_url)
+            payload = self._build_payload(
+                model.strip(),
+                compose_prompt(prompt, resolution, aspect_ratio),
+                system_prompt,
+                size,
+                extra_body_json,
+                image_inputs,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+            )
+            data = self._post_with_retries(endpoint, api_key, payload, int(timeout_seconds), int(retry_times))
+
+        choices = data.get("choices") or []
+        if choices:
+            message = choices[0].get("message") or {}
+            refs = collect_image_references(message)
+        else:
+            refs = []
+
+        if not refs:
+            refs = collect_image_references(data)
+        if not refs:
+            preview = json.dumps(redact_object(data), ensure_ascii=False)[:2000]
+            raise RuntimeError(f"Chat completion response did not contain image data or image URLs: {preview}")
+
+        image, decoded_refs = self._decode_refs_to_image(refs, int(timeout_seconds))
+        response_obj = redact_object(data) if redact_response else data
+        response_text = json.dumps(response_obj, ensure_ascii=False, indent=2)
+        refs_text = "\n".join(summarize_ref(ref) for ref in decoded_refs)
+        return image, response_text, refs_text
+
+
+class ChatImageBridge(ChatImageBridgeBase):
+    """Clean image generator node for OpenAI-compatible chat/completions endpoints."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "multiline": False}),
+                "base_url": ("STRING", {"default": "", "multiline": False}),
+                "model": ("STRING", {"default": DEFAULT_MODEL, "multiline": False}),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "resolution": (RESOLUTION_OPTIONS, {"default": "auto"}),
+                "aspect_ratio": (ASPECT_RATIO_OPTIONS, {"default": "auto"}),
+                "timeout_seconds": ("INT", {"default": 300, "min": 30, "max": 1800}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "generate"
+    CATEGORY = "api/Chat Image Bridge"
+
+    def generate(
+        self,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        resolution,
+        aspect_ratio,
+        timeout_seconds,
+        image_1=None,
+        image_2=None,
+    ):
+        image, _, _ = self._generate(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            system_prompt="",
+            size="",
+            extra_body_json="",
+            timeout_seconds=timeout_seconds,
+            retry_times=1,
+            redact_response=True,
+            resolution=resolution,
+            aspect_ratio=aspect_ratio,
+            image_01=image_1,
+            image_02=image_2,
+        )
+        return (image,)
+
+
+class ChatImageBridgeAdvanced(ChatImageBridgeBase):
+    """Advanced image generator node with raw response outputs and request overrides."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "multiline": False}),
+                "base_url": ("STRING", {"default": "", "multiline": False}),
+                "model": ("STRING", {"default": DEFAULT_MODEL, "multiline": False}),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "system_prompt": ("STRING", {"default": "", "multiline": True}),
+                "size": ("STRING", {"default": "", "multiline": False}),
+                "extra_body_json": ("STRING", {"default": "", "multiline": True}),
+                "timeout_seconds": ("INT", {"default": 300, "min": 30, "max": 1800}),
+                "retry_times": ("INT", {"default": 1, "min": 1, "max": 10}),
+                "redact_response": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                **{f"image_{i:02d}": ("IMAGE",) for i in range(1, 15)},
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("image", "response", "image_refs")
+    FUNCTION = "generate"
+    CATEGORY = "api/Chat Image Bridge"
+
+    def generate(
+        self,
+        api_key,
+        base_url,
+        model,
+        prompt,
+        system_prompt,
+        size,
+        extra_body_json,
+        timeout_seconds,
+        retry_times,
+        redact_response,
+        **kwargs,
+    ):
+        return self._generate(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            size=size,
+            extra_body_json=extra_body_json,
+            timeout_seconds=timeout_seconds,
+            retry_times=retry_times,
+            redact_response=redact_response,
+            **kwargs,
+        )
+
+
+NODE_CLASS_MAPPINGS = {
+    "ChatImageBridge": ChatImageBridge,
+    "ChatImageBridgeAdvanced": ChatImageBridgeAdvanced,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ChatImageBridge": "Chat Image Bridge",
+    "ChatImageBridgeAdvanced": "Chat Image Bridge Advanced",
+}
