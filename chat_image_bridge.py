@@ -23,18 +23,18 @@ GRSAI_PROXY_RE = re.compile(
 RESOLUTION_OPTIONS = ["auto", "1K", "2K", "4K"]
 ASPECT_RATIO_OPTIONS = ["auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"]
 DEFAULT_MODEL = "gemini-3-pro-image-preview"
-RIGHT_CODES_DEFAULT_BASE_URL = "https://www.right.codes/draw"
-RIGHT_CODES_MODELS = ["gpt-image-2-vip", "gpt-image-2", "nano-banana", "nano-banana-2", "nano-banana-pro"]
-RIGHT_CODES_RESOLUTION_OPTIONS = ["1K", "2K", "4K"]
-RIGHT_CODES_ASPECT_RATIO_OPTIONS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"]
-RIGHT_CODES_MODEL_RESOLUTIONS = {
+GPT_IMAGE_DEFAULT_BASE_URL = ""
+GPT_IMAGE_MODELS = ["gpt-image-2-vip", "gpt-image-2", "nano-banana", "nano-banana-2", "nano-banana-pro"]
+GPT_IMAGE_RESOLUTION_OPTIONS = ["1K", "2K", "4K"]
+GPT_IMAGE_ASPECT_RATIO_OPTIONS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"]
+GPT_IMAGE_MODEL_RESOLUTIONS = {
     "gpt-image-2-vip": {"1K", "2K", "4K"},
     "gpt-image-2": {"1K"},
     "nano-banana": {"1K"},
     "nano-banana-2": {"1K", "2K", "4K"},
     "nano-banana-pro": {"1K", "2K", "4K"},
 }
-RIGHT_CODES_SIZE_TABLE = {
+GPT_IMAGE_SIZE_TABLE = {
     "1K": {
         "1:1": "1280x1280",
         "2:3": "848x1280",
@@ -163,22 +163,22 @@ def normalize_generation_option(value):
     return value
 
 
-def right_codes_size_for(model, resolution, aspect_ratio):
+def gpt_image_size_for(model, resolution, aspect_ratio):
     model = (model or "").strip()
     resolution = (resolution or "").strip()
     aspect_ratio = (aspect_ratio or "").strip()
 
-    supported = RIGHT_CODES_MODEL_RESOLUTIONS.get(model)
+    supported = GPT_IMAGE_MODEL_RESOLUTIONS.get(model)
     if not supported:
-        raise ValueError(f"Unsupported Right Codes image model: {model}")
+        raise ValueError(f"Unsupported GPT Image model: {model}")
     if resolution not in supported:
         allowed = ", ".join(sorted(supported))
         raise ValueError(f"{model} supports resolution {allowed}, but got {resolution}")
 
     try:
-        return RIGHT_CODES_SIZE_TABLE[resolution][aspect_ratio]
+        return GPT_IMAGE_SIZE_TABLE[resolution][aspect_ratio]
     except KeyError as exc:
-        raise ValueError(f"Unsupported Right Codes size option: {resolution} {aspect_ratio}") from exc
+        raise ValueError(f"Unsupported GPT Image size option: {resolution} {aspect_ratio}") from exc
 
 
 def tensor_to_png_data_url(tensor):
@@ -682,19 +682,19 @@ class ChatImageBridgeAdvanced(ChatImageBridgeBase):
         )
 
 
-class RightCodesGPTImage(ChatImageBridgeBase):
-    """Right Codes draw node using streaming chat/completions requests."""
+class GPTImage(ChatImageBridgeBase):
+    """GPT image node using streaming chat/completions requests."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "api_key": ("STRING", {"default": "", "multiline": False}),
-                "base_url": ("STRING", {"default": RIGHT_CODES_DEFAULT_BASE_URL, "multiline": False}),
-                "model": (RIGHT_CODES_MODELS, {"default": "gpt-image-2-vip"}),
+                "base_url": ("STRING", {"default": GPT_IMAGE_DEFAULT_BASE_URL, "multiline": False}),
+                "model": (GPT_IMAGE_MODELS, {"default": "gpt-image-2-vip"}),
                 "prompt": ("STRING", {"default": "", "multiline": True}),
-                "resolution": (RIGHT_CODES_RESOLUTION_OPTIONS, {"default": "1K"}),
-                "aspect_ratio": (RIGHT_CODES_ASPECT_RATIO_OPTIONS, {"default": "1:1"}),
+                "resolution": (GPT_IMAGE_RESOLUTION_OPTIONS, {"default": "1K"}),
+                "aspect_ratio": (GPT_IMAGE_ASPECT_RATIO_OPTIONS, {"default": "1:1"}),
                 "timeout_seconds": ("INT", {"default": 600, "min": 60, "max": 3600}),
             },
             "optional": {
@@ -805,7 +805,7 @@ class RightCodesGPTImage(ChatImageBridgeBase):
                 preview = json.dumps(redact_object(data), ensure_ascii=False)[:2000]
                 if raw_preview and preview == '{"stream": true, "content": "", "chunks": []}':
                     preview = "\n".join(raw_preview)[:2000]
-                raise RuntimeError(f"Right Codes stream did not contain image data or image URLs: {preview}")
+                raise RuntimeError(f"GPT Image stream did not contain image data or image URLs: {preview}")
 
             return data, refs
 
@@ -818,7 +818,7 @@ class RightCodesGPTImage(ChatImageBridgeBase):
             raise ValueError("prompt is required")
 
         model = (model or "").strip()
-        size = right_codes_size_for(model, resolution, aspect_ratio)
+        size = gpt_image_size_for(model, resolution, aspect_ratio)
         endpoint = normalize_endpoint(base_url)
         payload = self._build_payload(model, prompt, size, [image_1, image_2])
         _, refs = self._post_streaming_chat(endpoint, api_key, payload, int(timeout_seconds))
@@ -829,11 +829,11 @@ class RightCodesGPTImage(ChatImageBridgeBase):
 NODE_CLASS_MAPPINGS = {
     "ChatImageBridge": ChatImageBridge,
     "ChatImageBridgeAdvanced": ChatImageBridgeAdvanced,
-    "RightCodesGPTImage": RightCodesGPTImage,
+    "GPTImage": GPTImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ChatImageBridge": "Chat Image Bridge",
     "ChatImageBridgeAdvanced": "Chat Image Bridge Advanced",
-    "RightCodesGPTImage": "Right Codes GPT Image",
+    "GPTImage": "GPT Image",
 }

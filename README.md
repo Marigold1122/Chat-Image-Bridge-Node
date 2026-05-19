@@ -1,8 +1,8 @@
 # ComfyUI Chat Image Bridge
 
-一个用于 ComfyUI 的第三方 API 生图节点集合，主要面向 OpenAI-compatible 聊天接口，也包含面向 Right Codes 绘图接口的专用节点。
+一个用于 ComfyUI 的第三方 API 生图节点集合，主要面向 OpenAI-compatible 聊天接口，也包含 GPT Image 专用请求节点。
 
-仓库不会内置任何 API Key。通用节点不内置服务商地址；Right Codes 专用节点会预填官方 `base_url`，方便直接使用，也可以自行修改。
+仓库不会内置任何 API Key 或服务商地址。用户需要在节点里填写自己的 `base_url`、`api_key` 和模型名。
 
 ## 功能
 
@@ -13,7 +13,7 @@
 - 支持 1K、2K、4K 分辨率和常见长宽比
 - 支持 1-2 张参考图输入
 - 支持解析 Markdown 图片、图片 URL、`b64_json`、Gemini `inlineData`
-- 提供 Right Codes GPT Image 专用节点，使用流式 `/v1/chat/completions`
+- 提供 GPT Image 专用节点，使用流式 `/v1/chat/completions`
 - 提供高级节点，可输出原始响应和图片引用，方便调试
 
 ## 安装
@@ -74,15 +74,15 @@ api -> Chat Image Bridge -> Chat Image Bridge
 
 可以直接接到 `Save Image` 或其他 ComfyUI 图像节点。
 
-## Right Codes GPT Image 节点
+## GPT Image 节点
 
 添加节点：
 
 ```text
-api -> Chat Image Bridge -> Right Codes GPT Image
+api -> Chat Image Bridge -> GPT Image
 ```
 
-这个节点面向 Right Codes 绘图接口，默认使用：
+这个节点面向 GPT Image / Nano Banana 这类绘图接口，使用流式 `/v1/chat/completions`。如果你的服务商使用 Right Codes draw 格式，`base_url` 可以填写：
 
 ```text
 https://www.right.codes/draw/v1/chat/completions
@@ -120,7 +120,7 @@ https://example.com/v1/chat/completions
 
 节点会自动整理为请求需要的接口地址。
 
-Right Codes 专用节点默认填的是：
+如果使用 Right Codes draw 格式，可以填：
 
 ```text
 https://www.right.codes/draw
@@ -174,7 +174,7 @@ gemini-3-pro-image-preview
 
 这样 `4K` 和长宽比会作为真正的图片参数发送，而不是只写进 prompt。
 
-Right Codes GPT Image 节点则会按接口文档传入 `size`，例如 `3840x2160`。
+GPT Image 节点则会按接口文档传入 `size`，例如 `3840x2160`。
 
 ## 高级节点
 
@@ -197,5 +197,5 @@ api -> Chat Image Bridge -> Chat Image Bridge Advanced
 
 - API Key 只在节点 UI 里填写，本仓库不会硬编码任何 Key。
 - 不同中转站对 OpenAI-compatible 的兼容程度不同，字段支持可能不完全一致。
-- `gpt-image-2` 和 `nano-banana` 在 Right Codes 节点里只开放 1K，选择更高分辨率会直接报错，避免请求失败或产生无效消耗。
+- `gpt-image-2` 和 `nano-banana` 在 GPT Image 节点里只开放 1K，选择更高分辨率会直接报错，避免请求失败或产生无效消耗。
 - 旧版工作流如果使用过 `endpoint_url`，建议改成新版的 `base_url`。
