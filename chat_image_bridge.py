@@ -16,6 +16,10 @@ DATA_IMAGE_RE = re.compile(
     re.I,
 )
 URL_RE = re.compile(r"https?://[^\s)\]\"'<>]+", re.I)
+GRSAI_PROXY_RE = re.compile(
+    r"^https?://grsai-file\d+\.dakka\.com\.cn/cnzfile/(?P<encoded>[^?#]+)(?P<suffix>[?#].*)?$",
+    re.I,
+)
 RESOLUTION_OPTIONS = ["auto", "1K", "2K", "4K"]
 ASPECT_RATIO_OPTIONS = ["auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"]
 DEFAULT_MODEL = "gemini-3-pro-image-preview"
@@ -297,6 +301,25 @@ def summarize_ref(ref):
     return ref
 
 
+def image_url_candidates(url):
+    candidates = [url]
+    match = GRSAI_PROXY_RE.match(url or "")
+    if match:
+        decoded = match.group("encoded").replace("_d_", ".").replace("_x_", "/")
+        if "/" in decoded:
+            host, path = decoded.split("/", 1)
+            if "." in host and path:
+                candidates.append(f"https://{host}/{path}{match.group('suffix') or ''}")
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
+
+
 class ChatImageBridgeBase:
     def _image_config(self, resolution="", aspect_ratio=""):
         image_config = {}
@@ -424,9 +447,25 @@ class ChatImageBridgeBase:
                 if ref.lower().startswith("data:image/"):
                     image_bytes = data_url_to_bytes(ref)
                 else:
-                    response = requests.get(ref, timeout=timeout_seconds)
-                    response.raise_for_status()
-                    image_bytes = response.content
+                    last_error = None
+                    image_bytes = None
+                    for url in image_url_candidates(ref):
+                        try:
+                            response = requests.get(
+                                url,
+                                timeout=timeout_seconds,
+                                headers={
+                                    "User-Agent": "Mozilla/5.0",
+                                    "Accept": "image/*,*/*;q=0.8",
+                                },
+                            )
+                            response.raise_for_status()
+                            image_bytes = response.content
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                    if image_bytes is None:
+                        raise last_error or RuntimeError("image download failed")
 
                 tensor = image_bytes_to_tensor(image_bytes)
                 tensors.append(tensor)
