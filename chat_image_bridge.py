@@ -751,9 +751,34 @@ class GPTImage(ChatImageBridgeBase):
             "Content-Type": "application/json",
             "Accept": "text/event-stream, application/json",
             "User-Agent": "ComfyUI-ChatImageBridge/1.0",
+            "Connection": "close",
         }
 
-        with requests.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds, stream=True) as response:
+        last_error = None
+        for attempt, trust_env in enumerate((True, False), start=1):
+            try:
+                return self._post_streaming_chat_once(
+                    endpoint,
+                    headers,
+                    payload,
+                    timeout_seconds,
+                    trust_env=trust_env,
+                )
+            except requests.exceptions.SSLError as exc:
+                last_error = exc
+                if attempt == 1:
+                    print("[Chat Image Bridge] GPT Image SSL request failed; retrying without environment proxy settings.")
+                    time.sleep(1)
+                    continue
+                break
+
+        raise last_error or RuntimeError("GPT Image stream request failed")
+
+    def _post_streaming_chat_once(self, endpoint, headers, payload, timeout_seconds, trust_env=True):
+        session = requests.Session()
+        session.trust_env = trust_env
+
+        with session.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds, stream=True) as response:
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
 
@@ -826,14 +851,18 @@ class GPTImage(ChatImageBridgeBase):
         return (image,)
 
 
+RightCodesGPTImage = GPTImage
+
 NODE_CLASS_MAPPINGS = {
     "ChatImageBridge": ChatImageBridge,
     "ChatImageBridgeAdvanced": ChatImageBridgeAdvanced,
     "GPTImage": GPTImage,
+    "RightCodesGPTImage": GPTImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ChatImageBridge": "Chat Image Bridge",
     "ChatImageBridgeAdvanced": "Chat Image Bridge Advanced",
     "GPTImage": "GPT Image",
+    "RightCodesGPTImage": "GPT Image",
 }

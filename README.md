@@ -82,11 +82,7 @@ api -> Chat Image Bridge -> Chat Image Bridge
 api -> Chat Image Bridge -> GPT Image
 ```
 
-这个节点面向 GPT Image / Nano Banana 这类绘图接口，使用流式 `/v1/chat/completions`。如果你的服务商使用 Right Codes draw 格式，`base_url` 可以填写：
-
-```text
-https://www.right.codes/draw/v1/chat/completions
-```
+这个节点面向 GPT Image / Nano Banana 这类绘图接口，使用流式 `/v1/chat/completions`。`base_url` 可以填写服务商根地址、`/v1` 地址，或完整 `/v1/chat/completions` 地址。
 
 你只需要填写 `api_key`、`prompt`，选择模型、分辨率和比例即可。节点内部会自动把 `1K / 2K / 4K` 和比例转换为接口需要的 `size`，例如：
 
@@ -119,18 +115,6 @@ https://example.com/v1/chat/completions
 ```
 
 节点会自动整理为请求需要的接口地址。
-
-如果使用 Right Codes draw 格式，可以填：
-
-```text
-https://www.right.codes/draw
-```
-
-最终请求时会自动整理为：
-
-```text
-https://www.right.codes/draw/v1/chat/completions
-```
 
 ## 获取模型列表
 
