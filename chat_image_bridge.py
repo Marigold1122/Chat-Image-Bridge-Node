@@ -19,6 +19,55 @@ URL_RE = re.compile(r"https?://[^\s)\]\"'<>]+", re.I)
 RESOLUTION_OPTIONS = ["auto", "1K", "2K", "4K"]
 ASPECT_RATIO_OPTIONS = ["auto", "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"]
 DEFAULT_MODEL = "gemini-3-pro-image-preview"
+RIGHT_CODES_DEFAULT_BASE_URL = "https://www.right.codes/draw"
+RIGHT_CODES_MODELS = ["gpt-image-2-vip", "gpt-image-2", "nano-banana", "nano-banana-2", "nano-banana-pro"]
+RIGHT_CODES_RESOLUTION_OPTIONS = ["1K", "2K", "4K"]
+RIGHT_CODES_ASPECT_RATIO_OPTIONS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"]
+RIGHT_CODES_MODEL_RESOLUTIONS = {
+    "gpt-image-2-vip": {"1K", "2K", "4K"},
+    "gpt-image-2": {"1K"},
+    "nano-banana": {"1K"},
+    "nano-banana-2": {"1K", "2K", "4K"},
+    "nano-banana-pro": {"1K", "2K", "4K"},
+}
+RIGHT_CODES_SIZE_TABLE = {
+    "1K": {
+        "1:1": "1280x1280",
+        "2:3": "848x1280",
+        "3:2": "1280x848",
+        "3:4": "960x1280",
+        "4:3": "1280x960",
+        "4:5": "1024x1280",
+        "5:4": "1280x1024",
+        "9:16": "720x1280",
+        "16:9": "1280x720",
+        "21:9": "1280x544",
+    },
+    "2K": {
+        "1:1": "2048x2048",
+        "2:3": "1360x2048",
+        "3:2": "2048x1360",
+        "3:4": "1536x2048",
+        "4:3": "2048x1536",
+        "4:5": "1632x2048",
+        "5:4": "2048x1632",
+        "9:16": "1152x2048",
+        "16:9": "2048x1152",
+        "21:9": "2048x864",
+    },
+    "4K": {
+        "1:1": "2880x2880",
+        "2:3": "2336x3520",
+        "3:2": "3520x2336",
+        "3:4": "2480x3312",
+        "4:3": "3312x2480",
+        "4:5": "2560x3216",
+        "5:4": "3216x2560",
+        "9:16": "2160x3840",
+        "16:9": "3840x2160",
+        "21:9": "3840x1632",
+    },
+}
 
 
 def normalize_endpoint(base_url):
@@ -110,6 +159,24 @@ def normalize_generation_option(value):
     return value
 
 
+def right_codes_size_for(model, resolution, aspect_ratio):
+    model = (model or "").strip()
+    resolution = (resolution or "").strip()
+    aspect_ratio = (aspect_ratio or "").strip()
+
+    supported = RIGHT_CODES_MODEL_RESOLUTIONS.get(model)
+    if not supported:
+        raise ValueError(f"Unsupported Right Codes image model: {model}")
+    if resolution not in supported:
+        allowed = ", ".join(sorted(supported))
+        raise ValueError(f"{model} supports resolution {allowed}, but got {resolution}")
+
+    try:
+        return RIGHT_CODES_SIZE_TABLE[resolution][aspect_ratio]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported Right Codes size option: {resolution} {aspect_ratio}") from exc
+
+
 def tensor_to_png_data_url(tensor):
     image = tensor.detach().cpu() if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor)
     if image.ndim == 4:
@@ -187,7 +254,10 @@ def collect_image_references(value):
 
         for key, item in value.items():
             if key == "b64_json" and isinstance(item, str):
-                refs.append("data:image/png;base64," + item)
+                if item.strip().lower().startswith("data:image/"):
+                    refs.append(item.strip())
+                else:
+                    refs.append("data:image/png;base64," + item)
             else:
                 refs.extend(collect_image_references(item))
 
@@ -573,12 +643,158 @@ class ChatImageBridgeAdvanced(ChatImageBridgeBase):
         )
 
 
+class RightCodesGPTImage(ChatImageBridgeBase):
+    """Right Codes draw node using streaming chat/completions requests."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "multiline": False}),
+                "base_url": ("STRING", {"default": RIGHT_CODES_DEFAULT_BASE_URL, "multiline": False}),
+                "model": (RIGHT_CODES_MODELS, {"default": "gpt-image-2-vip"}),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "resolution": (RIGHT_CODES_RESOLUTION_OPTIONS, {"default": "1K"}),
+                "aspect_ratio": (RIGHT_CODES_ASPECT_RATIO_OPTIONS, {"default": "1:1"}),
+                "timeout_seconds": ("INT", {"default": 600, "min": 60, "max": 3600}),
+            },
+            "optional": {
+                "image_1": ("IMAGE",),
+                "image_2": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "generate"
+    CATEGORY = "api/Chat Image Bridge"
+
+    def _build_payload(self, model, prompt, size, image_inputs):
+        image_data_urls = [tensor_to_png_data_url(image) for image in image_inputs if image is not None]
+        if image_data_urls:
+            content = [{"type": "text", "text": prompt}]
+            content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_data_urls)
+        else:
+            content = prompt
+
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "stream": True,
+            "size": size,
+        }
+
+    def _stream_text_from_chunk(self, chunk):
+        parts = []
+        for choice in chunk.get("choices") or []:
+            for field in ("delta", "message"):
+                message = choice.get(field) or {}
+                content = message.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, str):
+                            parts.append(item)
+                        elif isinstance(item, dict):
+                            text = item.get("text") or item.get("content")
+                            if isinstance(text, str):
+                                parts.append(text)
+                elif isinstance(content, dict):
+                    text = content.get("text") or content.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+        return "".join(parts)
+
+    def _post_streaming_chat(self, endpoint, api_key, payload, timeout_seconds):
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, application/json",
+            "User-Agent": "ComfyUI-ChatImageBridge/1.0",
+        }
+
+        with requests.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds, stream=True) as response:
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+
+            chunks = []
+            text_parts = []
+            raw_preview = []
+
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if isinstance(raw_line, bytes):
+                    line = raw_line.decode("utf-8", "replace")
+                else:
+                    line = raw_line or ""
+                line = line.strip()
+                if not line:
+                    continue
+
+                if len(raw_preview) < 20:
+                    raw_preview.append(line)
+
+                if line.startswith(":") or line.startswith("event:"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line or line == "[DONE]":
+                    continue
+
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    text_parts.append(line)
+                    continue
+
+                chunks.append(chunk)
+                text = self._stream_text_from_chunk(chunk)
+                if text:
+                    text_parts.append(text)
+
+            combined_text = "".join(text_parts)
+            data = {
+                "stream": True,
+                "content": combined_text,
+                "chunks": chunks,
+            }
+
+            refs = collect_image_references(combined_text)
+            if not refs:
+                refs = collect_image_references(chunks)
+            if not refs:
+                preview = json.dumps(redact_object(data), ensure_ascii=False)[:2000]
+                if raw_preview and preview == '{"stream": true, "content": "", "chunks": []}':
+                    preview = "\n".join(raw_preview)[:2000]
+                raise RuntimeError(f"Right Codes stream did not contain image data or image URLs: {preview}")
+
+            return data, refs
+
+    def generate(self, api_key, base_url, model, prompt, resolution, aspect_ratio, timeout_seconds, image_1=None, image_2=None):
+        if not (api_key or "").strip():
+            raise ValueError("api_key is required")
+        if not (base_url or "").strip():
+            raise ValueError("base_url is required")
+        if not (prompt or "").strip():
+            raise ValueError("prompt is required")
+
+        model = (model or "").strip()
+        size = right_codes_size_for(model, resolution, aspect_ratio)
+        endpoint = normalize_endpoint(base_url)
+        payload = self._build_payload(model, prompt, size, [image_1, image_2])
+        _, refs = self._post_streaming_chat(endpoint, api_key, payload, int(timeout_seconds))
+        image, _ = self._decode_refs_to_image(refs, int(timeout_seconds))
+        return (image,)
+
+
 NODE_CLASS_MAPPINGS = {
     "ChatImageBridge": ChatImageBridge,
     "ChatImageBridgeAdvanced": ChatImageBridgeAdvanced,
+    "RightCodesGPTImage": RightCodesGPTImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ChatImageBridge": "Chat Image Bridge",
     "ChatImageBridgeAdvanced": "Chat Image Bridge Advanced",
+    "RightCodesGPTImage": "Right Codes GPT Image",
 }

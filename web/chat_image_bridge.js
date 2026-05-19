@@ -27,8 +27,14 @@ function prepareModelWidget(node) {
 		return;
 	}
 
+	const currentModel = `${modelWidget.value || ""}`.trim();
+	const existingValues = Array.isArray(modelWidget.options?.values) ? modelWidget.options.values : [];
+	const values = ["", currentModel, ...existingValues]
+		.map((value) => `${value || ""}`.trim())
+		.filter((value, index, array) => index === array.indexOf(value));
+
 	modelWidget.options = modelWidget.options || {};
-	modelWidget.options.values = modelWidget.options.values || [modelWidget.value || ""];
+	modelWidget.options.values = values;
 	modelWidget.type = "combo";
 }
 
