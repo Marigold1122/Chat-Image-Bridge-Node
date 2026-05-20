@@ -34,6 +34,11 @@ GPT_IMAGE_MODEL_RESOLUTIONS = {
     "nano-banana-2": {"1K", "2K", "4K"},
     "nano-banana-pro": {"1K", "2K", "4K"},
 }
+GPT_IMAGE_RESOLUTION_LONG_EDGE = {
+    "1K": 1280,
+    "2K": 2048,
+    "4K": 3840,
+}
 GPT_IMAGE_SIZE_TABLE = {
     "1K": {
         "1:1": "1280x1280",
@@ -74,13 +79,6 @@ GPT_IMAGE_SIZE_TABLE = {
 }
 
 
-class RetryableImageGenerationError(RuntimeError):
-    def __init__(self, status_code, message, retry_after=None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.retry_after = retry_after
-
-
 def normalize_endpoint(base_url):
     value = (base_url or "").strip().rstrip("/")
     if not value:
@@ -92,19 +90,6 @@ def normalize_endpoint(base_url):
     if value.endswith("/v1"):
         return f"{value}/chat/completions"
     return f"{value}/v1/chat/completions"
-
-
-def normalize_images_endpoint(base_url):
-    value = (base_url or "").strip().rstrip("/")
-    if not value:
-        raise ValueError("base_url is required")
-    if value.endswith("/images/generations"):
-        return value
-    if value.endswith("/chat/completions"):
-        return value[: -len("/chat/completions")] + "/images/generations"
-    if value.endswith("/v1"):
-        return f"{value}/images/generations"
-    return f"{value}/v1/images/generations"
 
 
 def normalize_models_endpoint(base_url):
@@ -192,17 +177,20 @@ def gpt_image_size_for(model, resolution, aspect_ratio):
     resolution = (resolution or "auto").strip()
     aspect_ratio = (aspect_ratio or "auto").strip()
 
-    if resolution.lower() == "auto" and aspect_ratio.lower() == "auto":
-        return ""
-    if resolution.lower() == "auto" or aspect_ratio.lower() == "auto":
-        raise ValueError("GPT Image requires both resolution and aspect_ratio to be set together, or both set to auto")
-
     supported = GPT_IMAGE_MODEL_RESOLUTIONS.get(model)
     if not supported:
         raise ValueError(f"Unsupported GPT Image model: {model}")
-    if resolution not in supported:
+
+    resolution_is_auto = not resolution or resolution.lower() == "auto"
+    aspect_ratio_is_auto = not aspect_ratio or aspect_ratio.lower() == "auto"
+
+    if not resolution_is_auto and resolution not in supported:
         allowed = ", ".join(sorted(supported))
         raise ValueError(f"{model} supports resolution {allowed}, but got {resolution}")
+    if not aspect_ratio_is_auto and aspect_ratio not in GPT_IMAGE_SIZE_TABLE["1K"]:
+        raise ValueError(f"Unsupported GPT Image aspect ratio: {aspect_ratio}")
+    if resolution_is_auto or aspect_ratio_is_auto:
+        return ""
 
     try:
         return GPT_IMAGE_SIZE_TABLE[resolution][aspect_ratio]
@@ -210,31 +198,63 @@ def gpt_image_size_for(model, resolution, aspect_ratio):
         raise ValueError(f"Unsupported GPT Image size option: {resolution} {aspect_ratio}") from exc
 
 
-def retry_after_seconds_from_response(response):
-    retry_after = response.headers.get("Retry-After")
-    if retry_after:
-        try:
-            return max(0, int(float(retry_after)))
-        except (TypeError, ValueError):
-            pass
+def image_dimensions_from_tensor(tensor):
+    image = tensor.detach().cpu() if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor)
+    if image.ndim == 4:
+        image = image[0]
+    if image.ndim != 3:
+        raise ValueError(f"Expected IMAGE tensor with 3 or 4 dimensions, got shape {tuple(image.shape)}")
 
-    try:
-        payload = response.json()
-    except Exception:
-        payload = None
+    # ComfyUI images are usually HWC, but accept CHW tensors defensively.
+    if image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+        return int(image.shape[2]), int(image.shape[1])
+    return int(image.shape[1]), int(image.shape[0])
 
-    if isinstance(payload, dict):
-        for key in ("retry_after", "retryAfter", "retry_after_seconds", "retryAfterSeconds"):
-            value = payload.get(key)
-            if isinstance(value, (int, float)):
-                return max(0, int(value))
-            if isinstance(value, str):
-                try:
-                    return max(0, int(float(value)))
-                except ValueError:
-                    continue
 
-    return None
+def gpt_image_edit_size_for(model, resolution, image):
+    model = (model or "").strip()
+    resolution = (resolution or "auto").strip()
+
+    supported = GPT_IMAGE_MODEL_RESOLUTIONS.get(model)
+    if not supported:
+        raise ValueError(f"Unsupported GPT Image model: {model}")
+    if not resolution or resolution.lower() == "auto":
+        return ""
+    if resolution not in supported:
+        allowed = ", ".join(sorted(supported))
+        raise ValueError(f"{model} supports resolution {allowed}, but got {resolution}")
+
+    target_long_edge = GPT_IMAGE_RESOLUTION_LONG_EDGE.get(resolution)
+    if not target_long_edge:
+        raise ValueError(f"Unsupported GPT Image resolution: {resolution}")
+
+    width, height = image_dimensions_from_tensor(image)
+    long_edge = max(width, height)
+    if long_edge <= 0:
+        raise ValueError(f"Invalid image dimensions: {width}x{height}")
+
+    scale = target_long_edge / long_edge
+    target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
+    return f"{target_width}x{target_height}"
+
+
+def compose_gpt_image_prompt(prompt, size, resolution, aspect_ratio):
+    hints = []
+    resolution = (resolution or "auto").strip()
+    aspect_ratio = (aspect_ratio or "auto").strip()
+
+    if (size or "").strip():
+        hints.append(f"Target image size: {size.strip()}.")
+    else:
+        if resolution and resolution.lower() != "auto":
+            hints.append(f"Target image resolution: {resolution}.")
+        if aspect_ratio and aspect_ratio.lower() != "auto":
+            hints.append(f"Target image aspect ratio: {aspect_ratio}.")
+
+    if not hints:
+        return prompt
+    return "\n".join(hints + [prompt])
 
 
 def tensor_to_png_data_url(tensor):
@@ -738,8 +758,142 @@ class ChatImageBridgeAdvanced(ChatImageBridgeBase):
         )
 
 
-class GPTImage(ChatImageBridgeBase):
-    """GPT image node using the image generations endpoint."""
+class GPTImageBase(ChatImageBridgeBase):
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    CATEGORY = "api/Chat Image Bridge"
+
+    def _build_payload(self, model, prompt, size, image_inputs):
+        image_data_urls = [tensor_to_png_data_url(image) for image in image_inputs if image is not None]
+        if image_data_urls:
+            content = [{"type": "text", "text": prompt}]
+            content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_data_urls)
+        else:
+            content = prompt
+
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "stream": True,
+        }
+        if (size or "").strip():
+            payload["size"] = size
+        return payload
+
+    def _stream_text_from_chunk(self, chunk):
+        parts = []
+        for choice in chunk.get("choices") or []:
+            for field in ("delta", "message"):
+                message = choice.get(field) or {}
+                content = message.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, str):
+                            parts.append(item)
+                        elif isinstance(item, dict):
+                            text = item.get("text") or item.get("content")
+                            if isinstance(text, str):
+                                parts.append(text)
+                elif isinstance(content, dict):
+                    text = content.get("text") or content.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+        return "".join(parts)
+
+    def _post_streaming_chat(self, endpoint, api_key, payload, timeout_seconds):
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, application/json",
+            "User-Agent": "ComfyUI-ChatImageBridge/1.0",
+            "Connection": "close",
+        }
+
+        last_error = None
+        for attempt, trust_env in enumerate((True, False), start=1):
+            try:
+                return self._post_streaming_chat_once(
+                    endpoint,
+                    headers,
+                    payload,
+                    timeout_seconds,
+                    trust_env=trust_env,
+                )
+            except requests.exceptions.SSLError as exc:
+                last_error = exc
+                if attempt == 1:
+                    print("[Chat Image Bridge] GPT Image SSL request failed; retrying without environment proxy settings.")
+                    time.sleep(1)
+                    continue
+                break
+
+        raise last_error or RuntimeError("GPT Image stream request failed")
+
+    def _post_streaming_chat_once(self, endpoint, headers, payload, timeout_seconds, trust_env=True):
+        session = requests.Session()
+        session.trust_env = trust_env
+
+        with session.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds, stream=True) as response:
+            if response.status_code >= 400:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+
+            chunks = []
+            text_parts = []
+            raw_preview = []
+
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if isinstance(raw_line, bytes):
+                    line = raw_line.decode("utf-8", "replace")
+                else:
+                    line = raw_line or ""
+                line = line.strip()
+                if not line:
+                    continue
+
+                if len(raw_preview) < 20:
+                    raw_preview.append(line)
+
+                if line.startswith(":") or line.startswith("event:"):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line or line == "[DONE]":
+                    continue
+
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    text_parts.append(line)
+                    continue
+
+                chunks.append(chunk)
+                text = self._stream_text_from_chunk(chunk)
+                if text:
+                    text_parts.append(text)
+
+            combined_text = "".join(text_parts)
+            data = {
+                "stream": True,
+                "content": combined_text,
+                "chunks": chunks,
+            }
+
+            refs = collect_image_references(combined_text)
+            if not refs:
+                refs = collect_image_references(chunks)
+            if not refs:
+                preview = json.dumps(redact_object(data), ensure_ascii=False)[:2000]
+                if raw_preview and preview == '{"stream": true, "content": "", "chunks": []}':
+                    preview = "\n".join(raw_preview)[:2000]
+                raise RuntimeError(f"GPT Image stream did not contain image data or image URLs: {preview}")
+
+            return data, refs
+
+
+class GPTImage(GPTImageBase):
+    """GPT image generation node using streaming chat/completions requests."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -759,89 +913,7 @@ class GPTImage(ChatImageBridgeBase):
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
     FUNCTION = "generate"
-    CATEGORY = "api/Chat Image Bridge"
-
-    def _build_payload(self, model, prompt, size, image_inputs):
-        image_refs = [
-            tensor_to_png_inline_data(image)["data"]
-            for image in image_inputs
-            if image is not None
-        ]
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "image": image_refs,
-            "response_format": "url",
-        }
-        if (size or "").strip():
-            payload["size"] = size
-        return payload
-
-    def _post_image_generation(self, endpoint, api_key, payload, timeout_seconds):
-        headers = {
-            "Authorization": f"Bearer {api_key.strip()}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "ComfyUI-ChatImageBridge/1.0",
-            "Connection": "close",
-        }
-
-        last_error = None
-        trust_env = True
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                return self._post_image_generation_once(
-                    endpoint,
-                    headers,
-                    payload,
-                    timeout_seconds,
-                    trust_env=trust_env,
-                )
-            except requests.exceptions.SSLError as exc:
-                last_error = exc
-                if trust_env:
-                    print("[Chat Image Bridge] GPT Image request failed with SSL error; retrying without environment proxy settings.")
-                    time.sleep(1)
-                    trust_env = False
-                    continue
-                break
-            except RetryableImageGenerationError as exc:
-                last_error = exc
-                if attempt < max_attempts:
-                    wait_seconds = exc.retry_after if exc.retry_after is not None else 120
-                    print(f"[Chat Image Bridge] GPT Image request returned HTTP {exc.status_code}; retrying in {wait_seconds} seconds.")
-                    time.sleep(wait_seconds)
-                    continue
-                break
-
-        raise last_error or RuntimeError("GPT Image request failed")
-
-    def _post_image_generation_once(self, endpoint, headers, payload, timeout_seconds, trust_env=True):
-        session = requests.Session()
-        session.trust_env = trust_env
-
-        with session.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds) as response:
-            if response.status_code >= 400:
-                if response.status_code == 524:
-                    retry_after = retry_after_seconds_from_response(response) or 120
-                    raise RetryableImageGenerationError(
-                        response.status_code,
-                        f"HTTP {response.status_code}: {response.text[:1000]}",
-                        retry_after=retry_after,
-                    )
-                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
-
-            data = response.json()
-            refs = collect_image_references(data)
-            if not refs:
-                preview = json.dumps(redact_object(data), ensure_ascii=False)[:2000]
-                raise RuntimeError(f"GPT Image response did not contain image data or image URLs: {preview}")
-
-            return data, refs
 
     def generate(self, api_key, base_url, model, prompt, resolution, aspect_ratio, timeout_seconds, image_1=None, image_2=None):
         if not (api_key or "").strip():
@@ -853,11 +925,51 @@ class GPTImage(ChatImageBridgeBase):
 
         model = (model or "").strip()
         size = gpt_image_size_for(model, resolution, aspect_ratio)
-        endpoint = normalize_images_endpoint(base_url)
-        payload = self._build_payload(model, prompt, size, [image_1, image_2])
-        _, refs = self._post_image_generation(endpoint, api_key, payload, int(timeout_seconds))
+        image_inputs = [image_1, image_2]
+        prompt = compose_gpt_image_prompt(prompt, size, resolution, aspect_ratio)
+        endpoint = normalize_endpoint(base_url)
+        payload = self._build_payload(model, prompt, size, image_inputs)
+        _, refs = self._post_streaming_chat(endpoint, api_key, payload, int(timeout_seconds))
         image, _ = self._decode_refs_to_image(refs, int(timeout_seconds))
         return (image,)
+
+
+class GPTImageEdit(GPTImageBase):
+    """GPT image editing node that derives output size from the input image."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "api_key": ("STRING", {"default": "", "multiline": False}),
+                "base_url": ("STRING", {"default": GPT_IMAGE_DEFAULT_BASE_URL, "multiline": False}),
+                "model": (GPT_IMAGE_MODELS, {"default": "gpt-image-2-vip"}),
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "resolution": (GPT_IMAGE_RESOLUTION_OPTIONS, {"default": "auto"}),
+                "timeout_seconds": ("INT", {"default": 600, "min": 60, "max": 3600}),
+                "image": ("IMAGE",),
+            },
+        }
+
+    FUNCTION = "generate"
+
+    def generate(self, api_key, base_url, model, prompt, resolution, timeout_seconds, image=None):
+        if not (api_key or "").strip():
+            raise ValueError("api_key is required")
+        if not (base_url or "").strip():
+            raise ValueError("base_url is required")
+        if not (prompt or "").strip():
+            raise ValueError("prompt is required")
+        if image is None:
+            raise ValueError("image is required for GPT Image Edit")
+
+        model = (model or "").strip()
+        size = gpt_image_edit_size_for(model, resolution, image)
+        endpoint = normalize_endpoint(base_url)
+        payload = self._build_payload(model, prompt, size, [image])
+        _, refs = self._post_streaming_chat(endpoint, api_key, payload, int(timeout_seconds))
+        output_image, _ = self._decode_refs_to_image(refs, int(timeout_seconds))
+        return (output_image,)
 
 
 RightCodesGPTImage = GPTImage
@@ -866,12 +978,14 @@ NODE_CLASS_MAPPINGS = {
     "ChatImageBridge": ChatImageBridge,
     "ChatImageBridgeAdvanced": ChatImageBridgeAdvanced,
     "GPTImage": GPTImage,
+    "GPTImageEdit": GPTImageEdit,
     "RightCodesGPTImage": GPTImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ChatImageBridge": "Chat Image Bridge",
     "ChatImageBridgeAdvanced": "Chat Image Bridge Advanced",
-    "GPTImage": "GPT Image",
+    "GPTImage": "GPT Image Generate",
+    "GPTImageEdit": "GPT Image Edit",
     "RightCodesGPTImage": "GPT Image",
 }
