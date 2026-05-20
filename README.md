@@ -13,7 +13,7 @@
 - 支持 1K、2K、4K 分辨率和常见长宽比
 - 支持 1-2 张参考图输入
 - 支持解析 Markdown 图片、图片 URL、`b64_json`、Gemini `inlineData`
-- 提供 GPT Image 专用节点，使用流式 `/v1/chat/completions`
+- 提供 GPT Image 专用节点，使用 `/v1/images/generations`
 - 提供高级节点，可输出原始响应和图片引用，方便调试
 
 ## 安装
@@ -82,7 +82,7 @@ api -> Chat Image Bridge -> Chat Image Bridge
 api -> Chat Image Bridge -> GPT Image
 ```
 
-这个节点面向 GPT Image / Nano Banana 这类绘图接口，使用流式 `/v1/chat/completions`。`base_url` 可以填写服务商根地址、`/v1` 地址，或完整 `/v1/chat/completions` 地址。
+这个节点面向 GPT Image / Nano Banana 这类绘图接口，使用 `/v1/images/generations`。`base_url` 可以填写服务商根地址、`/v1` 地址，或完整 `/v1/images/generations` 地址。
 
 你只需要填写 `api_key`、`prompt`，选择模型、分辨率和比例即可。节点内部会自动把 `1K / 2K / 4K` 和比例转换为接口需要的 `size`，例如：
 
@@ -91,6 +91,10 @@ api -> Chat Image Bridge -> GPT Image
 2K + 1:1 -> 2048x2048
 1K + 9:16 -> 720x1280
 ```
+
+如果 `resolution=auto` 且 `aspect_ratio=auto`，节点不会传 `size`，交给服务商按默认策略决定图片尺寸。
+
+如果你想手动指定尺寸，那么 `resolution` 和 `aspect_ratio` 需要一起选择，不能只保留其中一个，避免组合出接口无法识别的 `size`。
 
 支持的模型：
 
@@ -102,7 +106,7 @@ api -> Chat Image Bridge -> GPT Image
 | `nano-banana-2` | 1K、2K、4K |
 | `nano-banana-pro` | 1K、2K、4K |
 
-节点使用流式 `/v1/chat/completions` 请求，适合生成时间较长的图片任务，减少 Cloudflare 超时概率。
+节点会向图片生成接口发送 `model`、`prompt`、`image` 和 `response_format=url`；当你明确选择分辨率和比例时，还会额外传入换算后的 `size`。如果服务商返回图片直链，节点会自动下载并转成 ComfyUI 的 `IMAGE`。
 
 ## base_url 填法
 
@@ -112,6 +116,7 @@ api -> Chat Image Bridge -> GPT Image
 https://example.com
 https://example.com/v1
 https://example.com/v1/chat/completions
+https://example.com/v1/images/generations
 ```
 
 节点会自动整理为请求需要的接口地址。
